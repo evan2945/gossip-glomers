@@ -1,0 +1,17 @@
+*.exe
+*.exe.*
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+main
+
+# Maelstrom store/logs directory
+store/
+maelstrom.log
+
+# OS / Editor clutter
+.DS_Store
+.vscode/
+.idea/
