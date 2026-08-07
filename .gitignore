@@ -18,7 +18,6 @@ maelstrom.log
 
 # Ignored binaries
 bin/
-cmd/*/*
 
 # Ignore downloaded Maelstrom directory & logs
 maelstrom/
