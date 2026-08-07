@@ -15,3 +15,11 @@ maelstrom.log
 .DS_Store
 .vscode/
 .idea/
+
+# Ignored binaries
+bin/
+cmd/*/*
+
+# Ignore downloaded Maelstrom directory & logs
+maelstrom/
+store/
