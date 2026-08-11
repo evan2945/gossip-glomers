@@ -1,15 +1,22 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
 func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	n := maelstrom.NewNode()
-	state := State{seenMessages: make(map[int]bool)}
+	state := State{
+		seenMessages: make(map[int]bool),
+		retryQueue:   make(map[RetryMessage]time.Time),
+	}
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		body := BroadcastBody{}
@@ -38,7 +45,9 @@ func main() {
 			return err
 		}
 
-		return nil
+		return n.Reply(msg, GossipReply{
+			Type: "gossip_ok",
+		})
 	})
 
 	n.Handle("read", func(msg maelstrom.Message) error {
@@ -70,9 +79,30 @@ func main() {
 		})
 	})
 
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				retryMessages := state.RetryQueue()
+				for msg, timestamp := range retryMessages {
+					if time.Since(timestamp) > 400*time.Millisecond {
+						sendGossipRpc(&state, n, msg.Dest, msg.Message)
+					}
+				}
+			}
+		}
+	}()
+
 	if err := n.Run(); err != nil {
 		log.Fatal(err)
 	}
+
+	cancel()
 }
 
 func handleGossip(state *State, n *maelstrom.Node, msg int, src string) error {
@@ -85,16 +115,40 @@ func handleGossip(state *State, n *maelstrom.Node, msg int, src string) error {
 			if neighbor == src {
 				continue
 			}
-			gossip := BroadcastBody{
-				Type:    "gossip",
-				Message: msg,
-			}
 
-			if err := n.Send(neighbor, gossip); err != nil {
-				return err
-			}
+			sendGossipRpc(state, n, neighbor, msg)
 		}
 	}
 
 	return nil
+}
+
+func sendGossipRpc(state *State, n *maelstrom.Node, neighbor string, msg int) {
+	gossip := BroadcastBody{
+		Type:    "gossip",
+		Message: msg,
+	}
+
+	retryMessage := RetryMessage{
+		Dest:    neighbor,
+		Message: gossip.Message,
+	}
+
+	n.RPC(neighbor, gossip, func(msg maelstrom.Message) error {
+		body := GossipReply{}
+
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+		// If we get a response back, don't attempt to retry.
+		if body.Type == "gossip_ok" {
+			state.RemoveFromRetryQueue(retryMessage)
+		}
+		return nil
+	})
+
+	// Add message to retry queue for now so that we can rery. If the message went through
+	// and we retry, the receiving node will filter out the repeated gossip packets and will
+	// attempt to reply "gossip_ok" again, at which point we can remove it from the retry queue
+	state.AddMsgToRetryQueue(retryMessage, time.Now())
 }

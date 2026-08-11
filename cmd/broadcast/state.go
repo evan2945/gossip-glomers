@@ -1,11 +1,16 @@
 package main
 
-import "sync"
+import (
+	"maps"
+	"sync"
+	"time"
+)
 
 type State struct {
 	mu           sync.RWMutex
 	seenMessages map[int]bool
 	neighbors    []string
+	retryQueue   map[RetryMessage]time.Time
 }
 
 func (s *State) AddMessageIfNew(msg int) bool {
@@ -46,4 +51,28 @@ func (s *State) Topology() []string {
 	copy(neighbors, s.neighbors)
 
 	return neighbors
+}
+
+func (s *State) AddMsgToRetryQueue(msg RetryMessage, timestamp time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.retryQueue[msg] = timestamp
+}
+
+func (s *State) RetryQueue() map[RetryMessage]time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	messages := map[RetryMessage]time.Time{}
+	maps.Copy(messages, s.retryQueue)
+
+	return messages
+}
+
+func (s *State) RemoveFromRetryQueue(msg RetryMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.retryQueue, msg)
 }

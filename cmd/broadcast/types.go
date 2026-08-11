@@ -27,3 +27,12 @@ type TopologyBody struct {
 type TopologyReply struct {
 	Type string `json:"type"`
 }
+
+type RetryMessage struct {
+	Dest    string
+	Message int
+}
+
+type GossipReply struct {
+	Type string `json:"type"`
+}
