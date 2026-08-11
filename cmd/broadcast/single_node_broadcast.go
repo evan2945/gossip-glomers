@@ -15,7 +15,8 @@ func main() {
 	n := maelstrom.NewNode()
 	state := State{
 		seenMessages: make(map[int]bool),
-		retryQueue:   make(map[RetryMessage]time.Time),
+		pendingBatch: make(map[string][]int),
+		retryQueue:   make(map[BatchKey]BatchEntry),
 	}
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
@@ -25,7 +26,7 @@ func main() {
 			return err
 		}
 
-		if err := handleGossip(&state, n, body.Message, msg.Src); err != nil {
+		if err := handleGossip(&state, []int{body.Message}, msg.Src); err != nil {
 			return err
 		}
 
@@ -35,18 +36,19 @@ func main() {
 	})
 
 	n.Handle("gossip", func(msg maelstrom.Message) error {
-		body := BroadcastBody{}
+		body := GossipBody{}
 
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
 
-		if err := handleGossip(&state, n, body.Message, msg.Src); err != nil {
+		if err := handleGossip(&state, body.Messages, msg.Src); err != nil {
 			return err
 		}
 
 		return n.Reply(msg, GossipReply{
-			Type: "gossip_ok",
+			Type:    "gossip_ok",
+			BatchID: body.BatchId,
 		})
 	})
 
@@ -72,7 +74,7 @@ func main() {
 			return err
 		}
 
-		state.AddNeighbors(body.Topology[n.ID()])
+		state.SetStarTopology(n.ID(), body.Topology)
 
 		return n.Reply(msg, TopologyReply{
 			Type: "topology_ok",
@@ -80,7 +82,7 @@ func main() {
 	})
 
 	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
+		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()
 
 		for {
@@ -88,11 +90,32 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// First, drain the retry queue
 				retryMessages := state.RetryQueue()
-				for msg, timestamp := range retryMessages {
-					if time.Since(timestamp) > 400*time.Millisecond {
-						sendGossipRpc(&state, n, msg.Dest, msg.Message)
+				for batchKey, batchEntry := range retryMessages {
+					if time.Since(batchEntry.SentAt) > 500*time.Millisecond {
+						sendGossipRpc(&state, n, batchKey, batchEntry)
 					}
+				}
+
+				// Second, drain the pending queue. We don't do this first because the messages will end up in the
+				// retry queue, which means unnecessary work.
+				pendingMessages := state.DrainPendingBatch()
+				for dest, messages := range pendingMessages {
+					if len(messages) == 0 {
+						continue
+					}
+
+					batchId := state.NextBatchId(n.ID())
+					batchKey := BatchKey{
+						Dest:    dest,
+						BatchID: batchId,
+					}
+					batchBody := BatchEntry{
+						Messages: messages,
+						SentAt:   time.Now(),
+					}
+					sendGossipRpc(&state, n, batchKey, batchBody)
 				}
 			}
 		}
@@ -105,9 +128,10 @@ func main() {
 	cancel()
 }
 
-func handleGossip(state *State, n *maelstrom.Node, msg int, src string) error {
+func handleGossip(state *State, messages []int, src string) error {
 	// If this node hasn't seen the message before, process it.
-	if state.AddMessageIfNew(msg) {
+	newMessages := state.FilterAndAddUnseen(messages)
+	if len(newMessages) > 0 {
 		neighbors := state.Topology()
 
 		for _, neighbor := range neighbors {
@@ -116,25 +140,24 @@ func handleGossip(state *State, n *maelstrom.Node, msg int, src string) error {
 				continue
 			}
 
-			sendGossipRpc(state, n, neighbor, msg)
+			// Instead of immediately sending, we should add it to a batch that is processed by our
+			// goroutine
+			// sendGossipRpc(state, n, neighbor, msg)
+			state.AddMessagesToPendingQueue(newMessages, neighbor)
 		}
 	}
 
 	return nil
 }
 
-func sendGossipRpc(state *State, n *maelstrom.Node, neighbor string, msg int) {
-	gossip := BroadcastBody{
-		Type:    "gossip",
-		Message: msg,
+func sendGossipRpc(state *State, n *maelstrom.Node, batchKey BatchKey, batchBody BatchEntry) {
+	gossip := GossipBody{
+		Type:     "gossip",
+		BatchId:  batchKey.BatchID,
+		Messages: batchBody.Messages,
 	}
 
-	retryMessage := RetryMessage{
-		Dest:    neighbor,
-		Message: gossip.Message,
-	}
-
-	n.RPC(neighbor, gossip, func(msg maelstrom.Message) error {
+	n.RPC(batchKey.Dest, gossip, func(msg maelstrom.Message) error {
 		body := GossipReply{}
 
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
@@ -142,7 +165,10 @@ func sendGossipRpc(state *State, n *maelstrom.Node, neighbor string, msg int) {
 		}
 		// If we get a response back, don't attempt to retry.
 		if body.Type == "gossip_ok" {
-			state.RemoveFromRetryQueue(retryMessage)
+			state.RemoveFromRetryQueue(BatchKey{
+				Dest:    msg.Src,
+				BatchID: body.BatchID,
+			})
 		}
 		return nil
 	})
@@ -150,5 +176,7 @@ func sendGossipRpc(state *State, n *maelstrom.Node, neighbor string, msg int) {
 	// Add message to retry queue for now so that we can rery. If the message went through
 	// and we retry, the receiving node will filter out the repeated gossip packets and will
 	// attempt to reply "gossip_ok" again, at which point we can remove it from the retry queue
-	state.AddMsgToRetryQueue(retryMessage, time.Now())
+	newBody := batchBody
+	newBody.SentAt = time.Now()
+	state.AddMsgToRetryQueue(batchKey, newBody)
 }
